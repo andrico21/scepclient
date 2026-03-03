@@ -1,0 +1,26 @@
+# Binaries
+scepclient
+scepclient.exe
+scepclient-*
+*.zip
+
+# Certificates and keys (generated at runtime)
+*.pem
+*.crt
+*.key
+*.der
+*.p7b
+*.p12
+*.pfx
+
+# Challenge password files
+pw.txt
+challenge.txt
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
