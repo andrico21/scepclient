@@ -8,10 +8,15 @@ AI-assisted development, built from scratch using only the Go standard library a
 
 - **Initial enrollment** (PKCSReq, messageType 19)
 - **Certificate renewal** (RenewalReq, messageType 17) using existing certificate as CMS signer
+- **Automatic polling** on PENDING status with configurable interval and timeout
 - **RFC 8894 compliance checking** — colored warnings for protocol deviations
+- **Structured exit codes** (0–5) for scripting and automation
+- **Silent mode** — no output, communicate only via exit codes
 - **Verbose mode** — full CMS operation trace for debugging
+- **Atomic certificate write** on renewal to prevent corruption of existing cert
 - **Challenge password** — supports file-based input to avoid shell quoting issues
 - **Custom TLS roots** — for HTTPS servers with private CA chains
+- **Build-time version injection** via `-ldflags`
 - **Self-contained** — single `main.go`, no framework dependencies
 
 ## Build
@@ -21,17 +26,17 @@ AI-assisted development, built from scratch using only the Go standard library a
 go build -o scepclient .
 
 # Production build (stripped, PIE, with version)
-go build -buildmode=pie -trimpath -ldflags="-s -w -X main.version=1.0" -o scepclient .
+go build -buildmode=pie -trimpath -ldflags="-s -w -X main.version=1.1" -o scepclient .
 ```
 
 ### Cross-compilation
 
 ```bash
 # Linux
-GOOS=linux GOARCH=amd64 go build -buildmode=pie -trimpath -ldflags="-s -w -X main.version=1.0" -o scepclient-linux-amd64 .
+GOOS=linux GOARCH=amd64 go build -buildmode=pie -trimpath -ldflags="-s -w -X main.version=1.1" -o scepclient-linux-amd64 .
 
 # macOS (Apple Silicon)
-GOOS=darwin GOARCH=arm64 go build -buildmode=pie -trimpath -ldflags="-s -w -X main.version=1.0" -o scepclient-darwin-arm64 .
+GOOS=darwin GOARCH=arm64 go build -buildmode=pie -trimpath -ldflags="-s -w -X main.version=1.1" -o scepclient-darwin-arm64 .
 ```
 
 ## Usage
