@@ -44,26 +44,17 @@ echo 'my-challenge-password' > pw.txt
 ./scepclient -url https://scep.example.com/scep/provisioner -challenge-file pw.txt
 
 # With custom TLS roots and verbose output
-./scepclient \
-  -url https://scep.example.com/scep/provisioner \
-  -challenge-file pw.txt \
-  -tls-roots /path/to/ca-bundle.pem \
-  -cn myhost.example.com \
-  -org "My Org" \
-  -country US \
-  -verbose
+./scepclient -url https://scep.example.com/scep/provisioner -challenge-file pw.txt -tls-roots /path/to/ca-bundle.pem -cn myhost.example.com -org "My Org" -country US -verbose
 ```
 
 ### Certificate Renewal
 
 ```bash
 # Renew using existing certificate and key
-./scepclient \
-  -url https://scep.example.com/scep/provisioner \
-  -renew \
-  -renew-cert cert.pem \
-  -key client.key \
-  -tls-roots /path/to/ca-bundle.pem
+
+./scepclient -url http://scep.example.com/scep/provisioner -renew -renew-cert cert.pem -key client.key
+# or
+./scepclient -url https://scep.example.com/scep/provisioner -renew -renew-cert cert.pem -key client.key [-tls-roots /path/to/ca-bundle.pem]
 ```
 
 The renewal CSR automatically uses the subject (CN, O, C) from the existing certificate.
@@ -85,7 +76,11 @@ The renewal CSR automatically uses the subject (CN, O, C) from the existing cert
 | `-tls-roots` | | PEM file with custom TLS root CA(s) for HTTPS |
 | `-renew` | `false` | Renew existing certificate (messageType 17) |
 | `-renew-cert` | | Path to existing certificate to renew |
+| `-no-poll` | `false` | Disable automatic polling on PENDING status |
+| `-poll-interval` | `30s` | Interval between CertPoll requests |
+| `-poll-timeout` | `10m` | Maximum time to wait for PENDING to resolve |
 | `-verbose` | `false` | Enable verbose logging |
+| `-silent` | `false` | Suppress all output, communicate only via exit codes |
 | `-version` | | Print version and exit |
 
 ## Output Levels
@@ -103,6 +98,17 @@ The client uses a structured output hierarchy:
 | `[INFO]` | `-verbose` | Detailed protocol trace |
 | `[RFC-OK]` | `-verbose` | Passed RFC compliance check |
 
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success — certificate issued |
+| `1` | Protocol failure — pkiStatus=FAILURE |
+| `2` | Pending — manual approval required (with `-no-poll`) |
+| `3` | Polling timeout — PENDING not resolved within `-poll-timeout` |
+| `4` | Network/HTTP error — server unreachable or returned error |
+| `5` | Client-side error — bad arguments, file I/O, key generation, CMS error |
+
 ## Protocol Flow
 
 The client implements the complete SCEP enrollment flow:
@@ -117,8 +123,9 @@ The client implements the complete SCEP enrollment flow:
 8. **Sign envelope** — CMS SignedData with SCEP authenticated attributes
 9. **PKIOperation** — HTTP POST (or GET fallback)
 10. **Parse CertRep** — extract pkiStatus, validate nonces and transactionID
-11. **Decrypt** — extract issued certificate from CMS envelope
-12. **Save** — write certificate, key, and CA cert to disk
+11. **CertPoll** *(if PENDING)* — automatic polling with IssuerAndSubject (messageType 20)
+12. **Decrypt** — extract issued certificate from CMS envelope
+13. **Save** — write certificate, key, and CA cert to disk
 
 ## RFC 8894 Compliance Checks
 
@@ -142,7 +149,6 @@ The client validates server behavior against RFC 8894 and reports deviations:
 ## Limitations
 
 - **RSA only** — SCEP (RFC 8894) defines RSA key transport; EC keys on the CA cert are not supported
-- **No polling** — PENDING status is reported but automatic polling is not implemented
 - **No GetCRL** — CRL retrieval is not implemented
 
 ## License
