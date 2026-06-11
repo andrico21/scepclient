@@ -42,7 +42,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
+          VERSION=${GITHUB_REF#refs/tags/}
           go build -buildmode=pie -trimpath \
             -ldflags="-s -w -X main.version=${VERSION}" \
             -o scepclient-${{ matrix.suffix }} .
@@ -70,6 +70,5 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: RELEASE_NOTES.md
           files: |
             scepclient-*
