@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -16,13 +17,16 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"math/big"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -127,7 +131,7 @@ var (
 
 func dbg(format string, a ...interface{}) {
 	if verbose {
-		fmt.Fprintf(os.Stderr, cCyan+"[INFO]"+cReset+"  "+format+"\n", a...)
+		fmt.Fprintf(os.Stderr, cCyan+"[DEBUG]"+cReset+" "+format+"\n", a...)
 	}
 }
 
@@ -197,8 +201,8 @@ func pubKeyHash(pub crypto.PublicKey) string {
 	return hex.EncodeToString(h[:])
 }
 
-func savePEM(path string, typ string, der []byte) error {
-	f, err := os.Create(path)
+func savePEM(path string, typ string, der []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		return err
 	}
@@ -244,13 +248,13 @@ func initHTTPClient(tlsRootsPath string) *http.Client {
 		fatal(exitClientError, "No PEM certificates found in %s", tlsRootsPath)
 	}
 	info("Loaded custom TLS roots from %s", tlsRootsPath)
+	// Clone the default transport so proxy, dialer, and timeout settings from
+	// the environment are preserved; only the TLS root set is overridden.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{RootCAs: pool}
 	return &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				RootCAs: pool,
-			},
-		},
+		Timeout:   30 * time.Second,
+		Transport: transport,
 	}
 }
 
@@ -297,11 +301,12 @@ func getCACaps(baseURL string) (*caCaps, error) {
 	if err != nil {
 		return nil, fmt.Errorf("GetCACaps: %w", err)
 	}
+	caps := &caCaps{}
 	if status != 200 {
-		return nil, fmt.Errorf("GetCACaps: HTTP %d", status)
+		warn("GetCACaps returned HTTP %d; proceeding with no advertised capabilities", status)
+		return caps, nil
 	}
 
-	caps := &caCaps{}
 	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -452,6 +457,149 @@ func getCACert(baseURL string) ([]*x509.Certificate, error) {
 	return certs, nil
 }
 
+// localFlagError marks a failure caused by a malformed local flag value rather
+// than by untrusted protocol data, so callers can map it to the client-error
+// exit code instead of the protocol-failure code.
+type localFlagError struct{ err error }
+
+func (e *localFlagError) Error() string { return e.err.Error() }
+func (e *localFlagError) Unwrap() error { return e.err }
+
+// isCACandidate reports whether a certificate is usable as a SCEP trust anchor:
+// it must assert the CA basic constraint per RFC 8894 §2.1.2.
+func isCACandidate(cert *x509.Certificate) bool {
+	return cert.BasicConstraintsValid && cert.IsCA
+}
+
+// selectCACerts picks the trust anchor and the encryption recipient from the
+// certificates returned by GetCACert. The anchor is the CA certificate (RFC
+// 8894 §2.1.2); the recipient is the certificate the client encrypts the CSR
+// to, which RFC 8894 §2.1.2 requires to assert keyEncipherment. When an RA
+// (non-CA) certificate with keyEncipherment is present it is preferred as the
+// recipient; otherwise the CA certificate is used.
+func selectCACerts(certs []*x509.Certificate) (anchor *x509.Certificate, recipient *x509.Certificate, err error) {
+	if len(certs) == 0 {
+		return nil, nil, fmt.Errorf("no certificates in GetCACert response")
+	}
+
+	for _, c := range certs {
+		if isCACandidate(c) && c.KeyUsage&x509.KeyUsageCertSign != 0 {
+			anchor = c
+			break
+		}
+	}
+	if anchor == nil {
+		for _, c := range certs {
+			if isCACandidate(c) {
+				anchor = c
+				break
+			}
+		}
+	}
+	if anchor == nil {
+		return nil, nil, fmt.Errorf("GetCACert response contains no CA certificate (BasicConstraints isCA=true)")
+	}
+
+	for _, c := range certs {
+		if !isCACandidate(c) && c.KeyUsage&x509.KeyUsageKeyEncipherment != 0 {
+			recipient = c
+			break
+		}
+	}
+	if recipient == nil {
+		if anchor.KeyUsage&x509.KeyUsageKeyEncipherment == 0 {
+			rfcWarn("2.1.2", "no certificate advertises keyEncipherment; encrypting CSR to CA certificate %q anyway", anchor.Subject.CommonName)
+		}
+		recipient = anchor
+	}
+	return anchor, recipient, nil
+}
+
+// normalizeCAFingerprint validates and canonicalizes a user-supplied
+// -ca-fingerprint value. RFC 8894 §2.2 fingerprints are a hash over the whole
+// DER certificate; this client requires SHA-256, accepting 64 hexadecimal
+// characters either bare or colon-separated, case-insensitively. The return
+// value is lowercase hex with separators removed.
+func normalizeCAFingerprint(raw string) (string, error) {
+	cleaned := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(raw), ":", ""))
+	if len(cleaned) != 64 {
+		return "", fmt.Errorf("-ca-fingerprint must be a SHA-256 hash (64 hex chars, optionally colon-separated); got %d hex chars", len(cleaned))
+	}
+	if _, err := hex.DecodeString(cleaned); err != nil {
+		return "", fmt.Errorf("-ca-fingerprint is not valid hexadecimal: %w", err)
+	}
+	return cleaned, nil
+}
+
+// buildCATrustPool establishes the SCEP message trust anchor from the GetCACert
+// certificates. When caFingerprint is set it must match exactly one CA
+// candidate's SHA-256 whole-certificate fingerprint (RFC 8894 §2.2/§4.2.1);
+// zero or multiple matches are fatal. When it is empty the best CA candidate is
+// trusted for this run only (trust on first use) with a loud warning. The
+// returned pool contains only the selected anchor as a root; every other CA
+// certificate is then verified to chain to that anchor (RFC 8894 §2.1.2).
+func buildCATrustPool(certs []*x509.Certificate, caFingerprint string) (*x509.CertPool, *x509.Certificate, error) {
+	anchor, _, err := selectCACerts(certs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if caFingerprint != "" {
+		want, ferr := normalizeCAFingerprint(caFingerprint)
+		if ferr != nil {
+			return nil, nil, &localFlagError{ferr}
+		}
+		var matched []*x509.Certificate
+		for _, c := range certs {
+			if fingerprint(c) == want {
+				matched = append(matched, c)
+			}
+		}
+		switch {
+		case len(matched) == 0:
+			return nil, nil, fmt.Errorf("-ca-fingerprint %s does not match any certificate returned by GetCACert; CA is not authenticated (RFC 8894 §2.2)", want)
+		case len(matched) > 1:
+			return nil, nil, fmt.Errorf("-ca-fingerprint %s matches %d certificates; ambiguous trust anchor", want, len(matched))
+		}
+		if !isCACandidate(matched[0]) {
+			return nil, nil, fmt.Errorf("-ca-fingerprint %s matches a non-CA certificate (subject %q); the fingerprint must authenticate the CA, not an RA/end-entity cert (RFC 8894 §2.2)", want, matched[0].Subject.CommonName)
+		}
+		anchor = matched[0]
+		rfcOK("CA certificate authenticated by -ca-fingerprint (RFC 8894 §2.2)")
+	} else {
+		warn("CA certificate is NOT authenticated: no -ca-fingerprint supplied.")
+		warn("Trusting CA %q for this run only (trust on first use).", anchor.Subject.CommonName)
+		warn("RFC 8894 §2.2 expects out-of-band CA authentication. Verify this fingerprint:")
+		warn("  SHA-256: %s", fingerprint(anchor))
+	}
+
+	roots := x509.NewCertPool()
+	roots.AddCert(anchor)
+
+	intermediates := x509.NewCertPool()
+	for _, c := range certs {
+		if c.Equal(anchor) {
+			continue
+		}
+		intermediates.AddCert(c)
+	}
+	for _, c := range certs {
+		if c.Equal(anchor) || !isCACandidate(c) {
+			continue
+		}
+		if _, verr := c.Verify(x509.VerifyOptions{
+			Roots:         roots,
+			Intermediates: intermediates,
+			CurrentTime:   time.Now(),
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+		}); verr != nil {
+			return nil, nil, fmt.Errorf("CA certificate %q does not chain to the trust anchor: %w", c.Subject.CommonName, verr)
+		}
+	}
+
+	return roots, anchor, nil
+}
+
 // ---------------------------------------------------------------------------
 // Step 3: Generate or load RSA private key
 // ---------------------------------------------------------------------------
@@ -460,7 +608,9 @@ func getOrCreateKey(keyPath string, keySize int) (*rsa.PrivateKey, error) {
 	info("=== Step 3: Private Key ===")
 
 	if keyPath != "" {
-		if _, err := os.Stat(keyPath); err == nil {
+		_, statErr := os.Stat(keyPath)
+		switch {
+		case statErr == nil:
 			key, err := loadPEMKey(keyPath)
 			if err != nil {
 				return nil, fmt.Errorf("loading key from %s: %w", keyPath, err)
@@ -473,6 +623,10 @@ func getOrCreateKey(keyPath string, keySize int) (*rsa.PrivateKey, error) {
 				rfcOK("RSA key size: %d bits", key.N.BitLen())
 			}
 			return key, nil
+		case !errors.Is(statErr, fs.ErrNotExist):
+			// Security (F8): a non-ENOENT stat error (e.g. EACCES) must fail loudly,
+			// never fall through to generation that would overwrite an unreadable key.
+			return nil, fmt.Errorf("stat key path %s: %w", keyPath, statErr)
 		}
 	}
 
@@ -488,10 +642,10 @@ func getOrCreateKey(keyPath string, keySize int) (*rsa.PrivateKey, error) {
 
 	if keyPath != "" {
 		der := x509.MarshalPKCS1PrivateKey(key)
-		if err := savePEM(keyPath, "RSA PRIVATE KEY", der); err != nil {
+		if err := savePEM(keyPath, "RSA PRIVATE KEY", der, 0o600); err != nil {
 			return nil, fmt.Errorf("saving key to %s: %w", keyPath, err)
 		}
-		info("Saved key to %s", keyPath)
+		info("Saved key to %s (mode 0600)", keyPath)
 	}
 
 	return key, nil
@@ -505,15 +659,18 @@ func getOrCreateKey(keyPath string, keySize int) (*rsa.PrivateKey, error) {
 //
 //	Attribute ::= SEQUENCE {
 //	    type   OBJECT IDENTIFIER (1.2.840.113549.1.9.7),
-//	    values SET { UTF8String challenge }
+//	    values SET { challenge }
 //	}
+//
+// The challenge string value is encoded by encoding/asn1, which emits a
+// PrintableString when every byte is printable ASCII and a UTF8String
+// otherwise.
 func buildChallengePasswordAttr(challenge string) ([]byte, error) {
 	oidDER, err := asn1.Marshal(oidChallengePassword)
 	if err != nil {
 		return nil, err
 	}
 
-	// Encode the password as UTF8String (PrintableString won't work for special chars)
 	pwDER, err := asn1.Marshal(challenge)
 	if err != nil {
 		return nil, err
@@ -678,19 +835,12 @@ func createCSR(key *rsa.PrivateKey, cn, org, country, challenge string) ([]byte,
 		}
 	}
 
-	// Parse it back to verify
+	// Parse it back to verify. A CSR we cannot parse is fatal: callers
+	// dereference csr.Subject and csr.PublicKey, so returning a nil CSR with a
+	// nil error would crash later instead of failing cleanly here.
 	csr, err := x509.ParseCertificateRequest(csrDER)
 	if err != nil {
-		// Go's parser may fail on non-standard attributes; dump DER for debugging
-		dbg("  [WARN] Go x509.ParseCertificateRequest failed: %v", err)
-		dbg("  CSR DER (base64): %s", base64.StdEncoding.EncodeToString(csrDER))
-		// Try to continue — the DER may still be valid per RFC even if Go can't parse it
-		info("CSR created (raw ASN.1): subject CN=%q, sigAlg=SHA256WithRSA", cn)
-		dbg("  CSR DER size: %d bytes", len(csrDER))
-		if challenge != "" {
-			dbg("  challengePassword: present (not logged for security)")
-		}
-		return csrDER, nil, nil
+		return nil, nil, fmt.Errorf("parsing generated CSR: %w", err)
 	}
 
 	if err := csr.CheckSignature(); err != nil {
@@ -707,7 +857,7 @@ func createCSR(key *rsa.PrivateKey, cn, org, country, challenge string) ([]byte,
 
 	// Debug: save CSR PEM for offline inspection
 	if verbose {
-		_ = savePEM("debug-csr.pem", "CERTIFICATE REQUEST", csrDER)
+		_ = savePEM("debug-csr.pem", "CERTIFICATE REQUEST", csrDER, 0o644)
 		dbg("  CSR saved to debug-csr.pem (inspect with: openssl req -text -noout -in debug-csr.pem)")
 	}
 
@@ -724,9 +874,6 @@ func createCSR(key *rsa.PrivateKey, cn, org, country, challenge string) ([]byte,
 		if !found {
 			dbg("  [WARN] challengePassword NOT found in csr.Attributes (Go parser may not extract it)")
 			dbg("  This is expected — Go's pkix.AttributeTypeAndValueSET cannot decode DirectoryString")
-			dbg("  The attribute IS present in the raw DER; dumping challengePassword attr hex:")
-			attrHex, _ := buildChallengePasswordAttr(challenge)
-			dbg("  challengePassword Attribute DER: %s", hex.EncodeToString(attrHex))
 		}
 	}
 
@@ -848,48 +995,19 @@ func buildIssuerAndSubject(caCert *x509.Certificate, csr *x509.CertificateReques
 // Step 7: Encrypt CSR → CMS EnvelopedData (pkcsPKIEnvelope)
 // ---------------------------------------------------------------------------
 
-func encryptCSR(csrDER []byte, caCert *x509.Certificate, caps *caCaps) ([]byte, error) {
+func encryptCSR(csrDER []byte, caCert *x509.Certificate) ([]byte, error) {
 	info("=== Step 7: Encrypt CSR → CMS EnvelopedData ===")
 
 	recipients := []*x509.Certificate{caCert}
 	dbg("  Encrypting %d bytes of CSR to %d recipient(s)", len(csrDER), len(recipients))
 	dbg("  Recipient: %q (fingerprint=%s)", caCert.Subject.CommonName, fingerprint(caCert))
 
-	// Choose encryption algorithm based on capabilities
-	var algName string
-	if caps.aes {
-		algName = "AES-128-CBC"
-		dbg("  Using AES-128-CBC encryption (server supports AES)")
-	} else if caps.des3 {
-		algName = "DES3-CBC"
-		dbg("  Using 3DES-CBC encryption (AES not available)")
-	} else {
-		algName = "DES3-CBC (fallback)"
-		rfcWarn("3.5.2", "No encryption capability advertised - falling back to 3DES-CBC (weak)")
-	}
-
-	// Set content encryption algorithm to match server capabilities
-	if caps.aes {
-		pkcs7.ContentEncryptionAlgorithm = pkcs7.EncryptionAlgorithmAES128CBC
-	} else {
-		pkcs7.ContentEncryptionAlgorithm = pkcs7.EncryptionAlgorithmDESCBC
-	}
 	envelope, err := pkcs7.Encrypt(csrDER, recipients)
 	if err != nil {
-		return nil, fmt.Errorf("CMS Encrypt (algo=%s): %w", algName, err)
+		return nil, fmt.Errorf("CMS Encrypt: %w", err)
 	}
 
 	dbg("  EnvelopedData size: %d bytes", len(envelope))
-
-	// Verify we can parse the envelope back
-	p7, err := pkcs7.Parse(envelope)
-	if err != nil {
-		dbg("  [WARN] Could not re-parse envelope for verification: %v", err)
-	} else {
-		dbg("  EnvelopedData re-parse: OK (content-type verified)")
-		_ = p7
-	}
-
 	return envelope, nil
 }
 
@@ -907,12 +1025,21 @@ func marshalPrintableString(s string) ([]byte, error) {
 	return asn1.Marshal(raw)
 }
 
-func signEnvelope(envelope []byte, signerCert *x509.Certificate, key *rsa.PrivateKey, txn *scepTransaction, messageType string) ([]byte, error) {
+func signEnvelope(envelope []byte, signerCert *x509.Certificate, key *rsa.PrivateKey, txn *scepTransaction, messageType string, caps *caCaps) ([]byte, error) {
 	info("=== Step 8: Sign Envelope → CMS SignedData ===")
 
 	sd, err := pkcs7.NewSignedData(envelope)
 	if err != nil {
 		return nil, fmt.Errorf("creating SignedData: %w", err)
+	}
+
+	// SCEP signers default to SHA-1 in this library; upgrade the message digest
+	// to SHA-256 whenever the CA advertises it (RFC 8894 §3.2 / GetCACaps SHA-256).
+	if caps.sha256 {
+		sd.SetDigestAlgorithm(pkcs7.OIDDigestAlgorithmSHA256)
+		info("Signature digest: SHA-256")
+	} else {
+		info("Signature digest: SHA-1 (CA did not advertise SHA-256)")
 	}
 
 	// Build SCEP authenticated attributes
@@ -977,7 +1104,7 @@ func sendPKIOperation(baseURL string, msg []byte, caps *caCaps) ([]byte, error) 
 	if caps.postSupported {
 		info("Sending PKIOperation via HTTP POST")
 		u := baseURL + "?operation=PKIOperation"
-		body, hdrs, status, err := httpPost(u, "application/octet-stream", msg)
+		body, hdrs, status, err := httpPost(u, "application/x-pki-message", msg)
 		if err != nil {
 			return nil, fmt.Errorf("PKIOperation POST: %w", err)
 		}
@@ -1006,10 +1133,12 @@ func sendPKIOperation(baseURL string, msg []byte, caps *caCaps) ([]byte, error) 
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
+	if len(s) > n {
+		s = s[:n] + "..."
 	}
-	return s[:n] + "..."
+	// Quote the server-controlled bytes so control characters and ANSI escape
+	// sequences cannot be injected into the terminal when logging responses.
+	return strconv.Quote(s)
 }
 
 // checkPKIOperationContentType validates the Content-Type of a PKIOperation response.
@@ -1039,7 +1168,7 @@ type certRepResult struct {
 	raw           *pkcs7.PKCS7
 }
 
-func parseCertRep(data []byte, caCerts []*x509.Certificate) (*certRepResult, error) {
+func parseCertRep(data []byte, roots *x509.CertPool) (*certRepResult, error) {
 	info("=== Step 10: Parse CertRep ===")
 	dbg("  Response size: %d bytes", len(data))
 
@@ -1054,24 +1183,14 @@ func parseCertRep(data []byte, caCerts []*x509.Certificate) (*certRepResult, err
 		dbg("    cert[%d]: subject=%q issuer=%q", i, c.Subject.CommonName, c.Issuer.CommonName)
 	}
 
-	// Verify signature. Add CA certs so verification chain can be built.
-	// Note: The response is signed by the CA, so we need to trust it.
-	if err := p7.Verify(); err != nil {
-		dbg("  Signature verification failed: %v", err)
-		dbg("  Attempting verification with CA certs injected...")
-
-		// Try with CA certs added
-		for _, caCert := range caCerts {
-			p7.Certificates = append(p7.Certificates, caCert)
-		}
-		if err2 := p7.Verify(); err2 != nil {
-			rfcWarn("4.3", "CertRep signature verification failed: %v (continuing anyway)", err2)
-		} else {
-			dbg("  Signature verification: OK (with CA certs)")
-		}
-	} else {
-		dbg("  Signature verification: OK")
+	// The CertRep signature MUST verify and chain to the authenticated CA
+	// anchor (RFC 8894 SS2.1.2, SS2.2); an unverifiable response is fatal so a
+	// forged or tampered CertRep can never reach decryption or disk.
+	if err := p7.VerifyWithChain(roots); err != nil {
+		return nil, fmt.Errorf("CertRep signature/chain verification failed: %w", err)
 	}
+	dbg("  Signature verification: OK (chained to CA trust anchor)")
+	rfcOK("CertRep signature verified against CA trust anchor")
 
 	result := &certRepResult{raw: p7}
 
@@ -1084,28 +1203,25 @@ func parseCertRep(data []byte, caCerts []*x509.Certificate) (*certRepResult, err
 	result.pkiStatus = statusRaw
 	dbg("  pkiStatus = %s", statusRaw)
 
-	// messageType (REQUIRED - RFC 8894 S3.2.1.1)
+	// messageType (REQUIRED - RFC 8894 S3.2.1.2)
 	var msgType string
 	if err := p7.UnmarshalSignedAttribute(oidSCEPmessageType, &msgType); err != nil {
-		rfcWarn("3.2.1.1", "CertRep missing messageType attribute: %v", err)
-	} else {
-		result.messageType = msgType
-		dbg("  messageType = %s", msgType)
-		if msgType != msgTypeCertRep {
-			rfcWarn("3.2.1.1", "Expected messageType=3 (CertRep), got %q", msgType)
-		} else {
-			rfcOK("messageType = 3 (CertRep)")
-		}
+		return nil, fmt.Errorf("CertRep missing required messageType attribute (RFC 8894 S3.2.1.2): %w", err)
 	}
+	result.messageType = msgType
+	dbg("  messageType = %s", msgType)
+	if msgType != msgTypeCertRep {
+		return nil, fmt.Errorf("CertRep has wrong messageType %q, expected 3 (CertRep) (RFC 8894 S3.2.1.2)", msgType)
+	}
+	rfcOK("messageType = 3 (CertRep)")
 
-	// transactionID (REQUIRED - RFC 8894 S3.2.1.2)
+	// transactionID (REQUIRED - RFC 8894 S3.2.1.1)
 	var txnID string
 	if err := p7.UnmarshalSignedAttribute(oidSCEPtransactionID, &txnID); err != nil {
-		rfcWarn("3.2.1.2", "CertRep missing transactionID attribute: %v", err)
-	} else {
-		result.transactionID = txnID
-		dbg("  transactionID = %s", txnID)
+		return nil, fmt.Errorf("CertRep missing required transactionID attribute (RFC 8894 S3.2.1.1): %w", err)
 	}
+	result.transactionID = txnID
+	dbg("  transactionID = %s", txnID)
 
 	// recipientNonce (REQUIRED - RFC 8894 S3.2.1.5)
 	var recipNonce []byte
@@ -1143,33 +1259,31 @@ func parseCertRep(data []byte, caCerts []*x509.Certificate) (*certRepResult, err
 // Step 11: Validate response nonces and transaction ID
 // ---------------------------------------------------------------------------
 
-func validateResponse(result *certRepResult, txn *scepTransaction) {
+func validateResponse(result *certRepResult, txn *scepTransaction) error {
 	info("=== Step 11: Validate Response ===")
 
-	// Check transactionID matches (REQUIRED - RFC 8894 S3.2.1.2)
-	if result.transactionID != "" && result.transactionID != txn.transactionID {
-		rfcWarn("3.2.1.2", "transactionID mismatch: sent=%s received=%s", txn.transactionID, result.transactionID)
-	} else if result.transactionID != "" {
-		rfcOK("transactionID: MATCH")
+	// transactionID MUST match the request (RFC 8894 S3.2.1.1).
+	if result.transactionID != txn.transactionID {
+		return fmt.Errorf("transactionID mismatch: sent=%s received=%s (RFC 8894 S3.2.1.1)", txn.transactionID, result.transactionID)
 	}
+	rfcOK("transactionID: MATCH")
 
-	// Check recipientNonce matches our senderNonce (RFC 8894 S3.2.1.5)
-	if len(result.recipNonce) > 0 {
-		if hex.EncodeToString(result.recipNonce) != hex.EncodeToString(txn.senderNonce) {
-			rfcWarn("3.2.1.5", "recipientNonce does not match senderNonce!")
-			dbg("  senderNonce:    %s", hex.EncodeToString(txn.senderNonce))
-			dbg("  recipientNonce: %s", hex.EncodeToString(result.recipNonce))
-		} else {
-			rfcOK("recipientNonce matches senderNonce")
-		}
-	} else {
-		rfcWarn("3.2.1.5", "CertRep does not contain recipientNonce - required by RFC 8894")
+	// recipientNonce MUST be present and MUST echo our senderNonce
+	// (RFC 8894 S3.2.1.5); a missing or mismatched nonce permits replay and
+	// is fatal with no override.
+	if len(result.recipNonce) == 0 {
+		return fmt.Errorf("CertRep does not contain recipientNonce (RFC 8894 S3.2.1.5)")
 	}
+	if subtle.ConstantTimeCompare(result.recipNonce, txn.senderNonce) != 1 {
+		return fmt.Errorf("recipientNonce does not match senderNonce: sent=%s received=%s (RFC 8894 S3.2.1.5)",
+			hex.EncodeToString(txn.senderNonce), hex.EncodeToString(result.recipNonce))
+	}
+	rfcOK("recipientNonce matches senderNonce")
 
-	// Log CA's own senderNonce (informational — used for future polling)
 	if len(result.senderNonce) > 0 {
-		dbg("  CA senderNonce: %s (would be used as recipientNonce in polling)", hex.EncodeToString(result.senderNonce))
+		dbg("  CA senderNonce: %s", hex.EncodeToString(result.senderNonce))
 	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1247,6 +1361,8 @@ func main() {
 		flagKeySize       = flag.Int("keysize", 2048, "RSA key size (if generating)")
 		flagOut           = flag.String("out", "cert.pem", "Output certificate path")
 		flagCACertOut     = flag.String("cacert", "ca.pem", "Output CA certificate path")
+		flagCAFingerprint = flag.String("ca-fingerprint", "", "Expected SHA-256 fingerprint of the CA certificate (64 hex chars, optionally colon-separated) for out-of-band CA authentication (RFC 8894 §2.2)")
+		flagAllowWeak     = flag.Bool("allow-weak-crypto", false, "Permit single-DES content encryption when the CA does not advertise AES (INSECURE, violates RFC 8894 §2.9)")
 		flagVerbose       = flag.Bool("verbose", false, "Enable verbose logging")
 		flagTLSRoots      = flag.String("tls-roots", "", "PEM file with custom TLS root CA(s) for HTTPS")
 		flagRenew         = flag.Bool("renew", false, "Renew existing certificate (uses RenewalReq messageType 17)")
@@ -1291,8 +1407,7 @@ func main() {
 		}
 	}
 	if challenge != "" {
-		dbg("Challenge password length: %d, first byte: 0x%02x, last byte: 0x%02x",
-			len(challenge), challenge[0], challenge[len(challenge)-1])
+		dbg("Challenge password length: %d", len(challenge))
 	}
 
 	if *flagURL == "" {
@@ -1318,23 +1433,53 @@ func main() {
 		fatal(exitNetwork, "GetCACaps failed: %v", err)
 	}
 
+	// Select the CMS content-encryption algorithm once, before any envelope is
+	// built. AES is mandatory unless the operator explicitly opts into the
+	// 56-bit single-DES fallback, which is cryptographically broken and
+	// violates RFC 8894 §2.9.
+	if caps.aes {
+		pkcs7.ContentEncryptionAlgorithm = pkcs7.EncryptionAlgorithmAES128CBC
+		info("Content encryption: AES-128-CBC")
+	} else if *flagAllowWeak {
+		pkcs7.ContentEncryptionAlgorithm = pkcs7.EncryptionAlgorithmDESCBC
+		rfcWarn("2.9", "CA does not advertise AES; using DES-CBC (56-bit, INSECURE) because -allow-weak-crypto was set")
+	} else {
+		fatal(exitProtoFail, "CA does not advertise AES content encryption; refusing to fall back to 56-bit DES (RFC 8894 §2.9). Re-run with -allow-weak-crypto to override.")
+	}
+
 	// Step 2: GetCACert
 	caCerts, err := getCACert(baseURL)
 	if err != nil {
 		fatal(exitNetwork, "GetCACert failed: %v", err)
 	}
 	if len(caCerts) == 0 {
-		fatal(exitNetwork, "No CA certificates received")
+		fatal(exitProtoFail, "No CA certificates received")
 	}
 
-	// Save CA cert
-	if err := savePEM(*flagCACertOut, "CERTIFICATE", caCerts[0].Raw); err != nil {
+	// Authenticate the CA and build the trust anchor used to verify every
+	// signed response. A malformed -ca-fingerprint is a local usage error
+	// (exit 5); any other failure means the CA data is untrustworthy (exit 1).
+	roots, anchor, err := buildCATrustPool(caCerts, *flagCAFingerprint)
+	if err != nil {
+		var lfe *localFlagError
+		if errors.As(err, &lfe) {
+			fatal(exitClientError, "%v", err)
+		}
+		fatal(exitProtoFail, "CA trust establishment failed: %v", err)
+	}
+
+	// Save the authenticated CA certificate (the trust anchor, not an RA cert).
+	if err := savePEM(*flagCACertOut, "CERTIFICATE", anchor.Raw, 0o644); err != nil {
 		fatal(exitClientError, "Saving CA cert: %v", err)
 	}
 	info("CA certificate saved to %s", *flagCACertOut)
 
-	// Use the first cert as the encryption recipient
-	caCert := caCerts[0]
+	// Select the encryption recipient (RA cert with keyEncipherment when the
+	// CA delegates to one, otherwise the CA itself).
+	_, caCert, err := selectCACerts(caCerts)
+	if err != nil {
+		fatal(exitProtoFail, "Selecting encryption recipient: %v", err)
+	}
 
 	// Step 3: Get or create RSA key
 	key, err := getOrCreateKey(*flagKey, *flagKeySize)
@@ -1353,6 +1498,9 @@ func main() {
 		if *flagRenewCert == "" {
 			fatal(exitClientError, "-renew requires -renew-cert <path> to existing certificate")
 		}
+		if !caps.renewal {
+			warn("-renew requested but the CA did not advertise the Renewal capability (RFC 8894 S3.1) - the request may be rejected")
+		}
 		if challenge != "" {
 			warn("Challenge password provided for renewal - RFC 8894 S2.4: clients SHOULD omit challengePassword but MAY include it")
 		}
@@ -1370,6 +1518,13 @@ func main() {
 		signerCert, err = x509.ParseCertificate(block.Bytes)
 		if err != nil {
 			fatal(exitClientError, "Parsing renewal cert: %v", err)
+		}
+		// The renewal cert must correspond to the loaded private key; otherwise
+		// the CMS signature would be made with a key the cert does not certify,
+		// which the CA will reject (and which usually means the wrong -key or
+		// -renew-cert was supplied).
+		if pubKeyHash(signerCert.PublicKey) != pubKeyHash(&key.PublicKey) {
+			fatal(exitClientError, "Renewal certificate public key does not match the private key in %s (wrong -renew-cert or -key?)", *flagKey)
 		}
 		info("Using existing cert as signer: subject=%q serial=%s", signerCert.Subject.CommonName, signerCert.SerialNumber)
 		if time.Now().After(signerCert.NotAfter) {
@@ -1410,13 +1565,13 @@ func main() {
 	}
 
 	// Step 7: Encrypt CSR
-	envelope, err := encryptCSR(csrDER, caCert, caps)
+	envelope, err := encryptCSR(csrDER, caCert)
 	if err != nil {
 		fatal(exitClientError, "CSR encryption failed: %v", err)
 	}
 
 	// Step 8: Sign envelope
-	msg, err := signEnvelope(envelope, signerCert, key, txn, msgType)
+	msg, err := signEnvelope(envelope, signerCert, key, txn, msgType, caps)
 	if err != nil {
 		fatal(exitClientError, "Envelope signing failed: %v", err)
 	}
@@ -1428,13 +1583,15 @@ func main() {
 	}
 
 	// Step 10: Parse CertRep
-	result, err := parseCertRep(respBytes, caCerts)
+	result, err := parseCertRep(respBytes, roots)
 	if err != nil {
-		fatal(exitClientError, "CertRep parsing failed: %v", err)
+		fatal(exitProtoFail, "CertRep parsing failed: %v", err)
 	}
 
 	// Step 11: Validate response
-	validateResponse(result, txn)
+	if err := validateResponse(result, txn); err != nil {
+		fatal(exitProtoFail, "Response validation failed: %v", err)
+	}
 
 	// Handle status
 	switch result.pkiStatus {
@@ -1467,7 +1624,8 @@ func main() {
 
 		// Auto-poll: build CertPoll messages until SUCCESS, FAILURE, or timeout
 		info("Starting automatic polling (interval=%s, timeout=%s)", *flagPollInterval, *flagPollTimeout)
-		pollDeadline := time.Now().Add(*flagPollTimeout)
+		pollStart := time.Now()
+		pollDeadline := pollStart.Add(*flagPollTimeout)
 		pollCount := 0
 		for {
 			if time.Now().After(pollDeadline) {
@@ -1476,7 +1634,9 @@ func main() {
 			time.Sleep(*flagPollInterval)
 			pollCount++
 
-			// Update nonce: use CA's senderNonce as our new recipientNonce
+			// Each CertPoll carries a fresh senderNonce. Per RFC 8894 §3.3.2 and
+			// Appendix A the CertPoll itself omits recipientNonce; the CA echoes
+			// this senderNonce back as the recipientNonce we validate.
 			pollTxn := &scepTransaction{
 				transactionID: txn.transactionID,
 				senderNonce:   make([]byte, 16),
@@ -1494,13 +1654,13 @@ func main() {
 			}
 
 			// Encrypt IssuerAndSubject to CA
-			pollEnvelope, err := encryptCSR(pollContent, caCert, caps)
+			pollEnvelope, err := encryptCSR(pollContent, caCert)
 			if err != nil {
 				fatal(exitClientError, "Encrypting poll content: %v", err)
 			}
 
 			// Sign with messageType=20 (GetCertInitial)
-			pollMsg, err := signEnvelope(pollEnvelope, signerCert, key, pollTxn, msgTypeCertPoll)
+			pollMsg, err := signEnvelope(pollEnvelope, signerCert, key, pollTxn, msgTypeCertPoll, caps)
 			if err != nil {
 				fatal(exitClientError, "Signing poll message: %v", err)
 			}
@@ -1513,12 +1673,13 @@ func main() {
 			}
 
 			// Parse response
-			pollResult, err := parseCertRep(pollResp, caCerts)
+			pollResult, err := parseCertRep(pollResp, roots)
 			if err != nil {
-				warn("CertPoll attempt %d: parse error: %v (will retry)", pollCount, err)
-				continue
+				fatal(exitProtoFail, "CertPoll response verification failed: %v", err)
 			}
-			validateResponse(pollResult, pollTxn)
+			if err := validateResponse(pollResult, pollTxn); err != nil {
+				fatal(exitProtoFail, "CertPoll response validation failed: %v", err)
+			}
 
 			switch pollResult.pkiStatus {
 			case statusSUCCESS:
@@ -1538,7 +1699,7 @@ func main() {
 				printRFCSummary()
 				os.Exit(exitProtoFail)
 			case statusPENDING:
-				info("Still PENDING (attempt %d/%s elapsed)", pollCount, time.Since(pollDeadline.Add(-*flagPollTimeout)).Round(time.Second))
+				info("Still PENDING (attempt %d/%s elapsed)", pollCount, time.Since(pollStart).Round(time.Second))
 			}
 		}
 	default:
@@ -1553,34 +1714,31 @@ extractCert:
 		fatal(exitClientError, "Certificate extraction failed: %v", err)
 	}
 
-	// Validate issued certificate public key matches our private key
+	// The issued certificate MUST certify our own public key (RFC 8894 S3.3.2).
+	// A mismatch means the CA bound the certificate to a different key, so it is
+	// useless to us and a sign of a misissue or a swapped response; fail without
+	// writing it to disk.
 	issuedPubHash := pubKeyHash(issuedCert.PublicKey)
 	clientPubHash := pubKeyHash(&key.PublicKey)
 	if issuedPubHash != clientPubHash {
-		rfcWarn("4.3", "Issued certificate public key does NOT match client key!")
 		dbg("  Issued cert pubkey: %s", issuedPubHash)
 		dbg("  Client key pubkey:  %s", clientPubHash)
-	} else {
-		rfcOK("Issued certificate public key matches client key")
+		fatal(exitProtoFail, "Issued certificate public key does not match the client private key (RFC 8894 S3.3.2); not saving certificate")
 	}
+	rfcOK("Issued certificate public key matches client key")
 
-	// Step 13: Save issued certificate
-	// For renewal: use atomic write (temp + rename) to avoid corrupting the
-	// existing certificate if something goes wrong during the write.
-	if *flagRenew {
-		tmpPath := *flagOut + ".tmp"
-		if err := savePEM(tmpPath, "CERTIFICATE", issuedCert.Raw); err != nil {
-			fatal(exitClientError, "Saving issued cert to temp file: %v", err)
-		}
-		if err := os.Rename(tmpPath, *flagOut); err != nil {
-			fatal(exitClientError, "Renaming temp cert %s -> %s: %v", tmpPath, *flagOut, err)
-		}
-		dbg("Atomic write: %s -> %s", tmpPath, *flagOut)
-	} else {
-		if err := savePEM(*flagOut, "CERTIFICATE", issuedCert.Raw); err != nil {
-			fatal(exitClientError, "Saving issued cert: %v", err)
-		}
+	// Step 13: Save issued certificate atomically (temp + rename) so a failed
+	// write never leaves a corrupt or partial cert in place, for both initial
+	// enrollment and renewal.
+	tmpPath := *flagOut + ".tmp"
+	if err := savePEM(tmpPath, "CERTIFICATE", issuedCert.Raw, 0o644); err != nil {
+		fatal(exitClientError, "Saving issued cert to temp file: %v", err)
 	}
+	if err := os.Rename(tmpPath, *flagOut); err != nil {
+		_ = os.Remove(tmpPath)
+		fatal(exitClientError, "Renaming temp cert %s -> %s: %v", tmpPath, *flagOut, err)
+	}
+	dbg("Atomic write: %s -> %s", tmpPath, *flagOut)
 	ok("Issued certificate saved to %s", *flagOut)
 	ok("Private key: %s", *flagKey)
 	ok("CA certificate: %s", *flagCACertOut)
